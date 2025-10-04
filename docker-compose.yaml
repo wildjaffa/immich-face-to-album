@@ -1,0 +1,13 @@
+version: '3.8'
+services:
+  immich-face-to-album:
+    image: ghcr.io/wildjaffa/immich-face-to-album:latest
+    container_name: immich-face-to-album
+    restart: unless-stopped
+    environment:
+      - CRON_EXPRESSION=0 * * * * # runs every hour, adjust as needed
+      - IMMICH_API_KEY=your_immich_api_key
+      - IMMICH_SERVER_URL=https://your-immich-server-url
+    volumes:
+      - ./config.json:/app/config.json:ro # your face-to-album mapping config
+    command: ["python", "-m", "immich_face_to_album", "--config", "/app/config.json"]

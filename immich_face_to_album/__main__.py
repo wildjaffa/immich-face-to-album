@@ -2,6 +2,9 @@ import requests
 import click
 import json
 import time
+import os
+from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 
 def get_time_buckets(server_url, key, face_id, size="MONTH", verbose=False):
@@ -108,105 +111,93 @@ def chunker(seq, size):
     return (seq[pos : pos + size] for pos in range(0, len(seq), size))
 
 
+
 @click.command()
-@click.option("--key", help="Your Immich API Key", required=True)
-@click.option("--server", help="Your Immich server URL", required=True)
-@click.option(
-    "--face",
-    help="ID of the face you want to copy from. Can be used multiple times.",
-    multiple=True,
-    required=True,
-)
-@click.option(
-    "--skip-face",
-    help="ID of a face to exclude (can be used multiple times).",
-    multiple=True,
-)
-@click.option("--album", help="ID of the album you want to copy to", required=True)
-@click.option(
-    "--timebucket", help="Time bucket size (e.g., MONTH, WEEK)", default="MONTH"
-)
+@click.option("--key", help="Your Immich API Key")
+@click.option("--server", help="Your Immich server URL")
+@click.option("--face", help="ID of the face you want to copy from. Can be used multiple times.", multiple=True)
+@click.option("--skip-face", help="ID of a face to exclude (can be used multiple times).", multiple=True)
+@click.option("--album", help="ID of the album you want to copy to")
+@click.option("--timebucket", help="Time bucket size (e.g., MONTH, WEEK)", default="MONTH")
 @click.option("--verbose", is_flag=True, help="Enable verbose output for debugging")
-@click.option(
-    "--run-every-seconds",
-    type=int,
-    default=0,
-    show_default=True,
-    help="Automatically rerun synchronization every N seconds (0 = run once).",
-)
-def face_to_album(
-    key, server, face, skip_face, album, timebucket, verbose, run_every_seconds
-):
-    headers = {"Accept": "application/json", "x-api-key": key}
-
-    def run_once():
+@click.option("--run-every-seconds", type=int, default=0, show_default=True, help="Automatically rerun synchronization every N seconds (0 = run once).")
+@click.option("--config", type=click.Path(exists=True), help="Path to config file for face-to-album mappings.")
+def face_to_album(key, server, face, skip_face, album, timebucket, verbose, run_every_seconds, config):
+    """
+    If --config is provided, load mappings from config file and process each mapping.
+    Otherwise, fallback to CLI options for backward compatibility.
+    """
+    def process_mapping(mapping):
+        # mapping: {"faceIds": [...], "albumId": ...}
         unique_asset_ids = set()
-
-        # Collect assets for included faces
-        for face_id in face:
+        album_id = mapping["albumId"]
+        face_ids = mapping["faceIds"]
+        skip_face_ids = mapping.get("skipFaceIds", [])
+        for face_id in face_ids:
             if verbose:
-                click.echo(f"Processing face ID: {face_id}")
-
+                click.echo(f"Processing face ID: {face_id} for album {album_id}")
             time_buckets = get_time_buckets(server, key, face_id, timebucket, verbose)
-
             for bucket in time_buckets:
                 bucket_time = bucket.get("timeBucket")
-                bucket_assets = get_assets_for_time_bucket(
-                    server, key, face_id, bucket_time, timebucket, verbose
-                )
+                bucket_assets = get_assets_for_time_bucket(server, key, face_id, bucket_time, timebucket, verbose)
                 unique_asset_ids.update(bucket_assets["id"])
-
-        # Collect and exclude assets for skip faces
-        if skip_face:
+        # Exclude assets for skip faces
+        if skip_face_ids:
             skip_asset_ids = set()
-            for s_face in skip_face:
+            for s_face in skip_face_ids:
                 if verbose:
                     click.echo(f"Collecting assets to skip for face ID: {s_face}")
-                time_buckets = get_time_buckets(
-                    server, key, s_face, timebucket, verbose
-                )
+                time_buckets = get_time_buckets(server, key, s_face, timebucket, verbose)
                 for bucket in time_buckets:
                     bucket_time = bucket.get("timeBucket")
-                    bucket_assets = get_assets_for_time_bucket(
-                        server, key, s_face, bucket_time, timebucket, verbose
-                    )
+                    bucket_assets = get_assets_for_time_bucket(server, key, s_face, bucket_time, timebucket, verbose)
                     skip_asset_ids.update(bucket_assets["id"])
             before = len(unique_asset_ids)
             unique_asset_ids.difference_update(skip_asset_ids)
             removed = before - len(unique_asset_ids)
             click.echo(f"Excluded {removed} asset(s) belonging to skipped face(s)")
-
-        click.echo(f"Total unique assets to add: {len(unique_asset_ids)}")
-
+        click.echo(f"Total unique assets to add to album {album_id}: {len(unique_asset_ids)}")
         asset_ids_list = list(unique_asset_ids)
-
         for asset_chunk in chunker(asset_ids_list, 500):
             if verbose:
-                click.echo(
-                    f"Adding chunk of {len(asset_chunk)} assets to album {album}"
-                )
-            success = add_assets_to_album(server, key, album, asset_chunk, verbose)
+                click.echo(f"Adding chunk of {len(asset_chunk)} assets to album {album_id}")
+            success = add_assets_to_album(server, key, album_id, asset_chunk, verbose)
             if success:
-                click.echo(
-                    click.style(
-                        f"Added {len(asset_chunk)} asset(s) to the album", fg="green"
-                    )
-                )
+                click.echo(click.style(f"Added {len(asset_chunk)} asset(s) to the album {album_id}", fg="green"))
 
-    if run_every_seconds and run_every_seconds > 0:
+    def run_once():
+        if config:
+            with open(config, "r") as f:
+                config_data = json.load(f)
+            mappings = config_data.get("mappings", [])
+            for mapping in mappings:
+                process_mapping(mapping)
+        else:
+            # fallback to CLI options
+            mapping = {
+                "faceIds": list(face),
+                "albumId": album,
+                "skipFaceIds": list(skip_face)
+            }
+            process_mapping(mapping)
+
+    cron_expr = os.environ.get("CRON_EXPRESSION")
+    if cron_expr:
+        click.echo(f"Scheduling sync with CRON_EXPRESSION: {cron_expr}")
+        scheduler = BlockingScheduler()
+        scheduler.add_job(run_once, CronTrigger.from_crontab(cron_expr))
+        try:
+            scheduler.start()
+        except (KeyboardInterrupt, SystemExit):
+            click.echo(click.style("Scheduler stopped.", fg="yellow"))
+    elif run_every_seconds and run_every_seconds > 0:
         try:
             while True:
                 run_once()
-                click.echo(
-                    f"Waiting {run_every_seconds} second(s) before next execution..."
-                )
+                click.echo(f"Waiting {run_every_seconds} second(s) before next execution...")
                 time.sleep(run_every_seconds)
         except KeyboardInterrupt:
-            click.echo(
-                click.style(
-                    "Stop requested (Ctrl+C). Ending repeated execution.", fg="yellow"
-                )
-            )
+            click.echo(click.style("Stop requested (Ctrl+C). Ending repeated execution.", fg="yellow"))
     else:
         run_once()
 
